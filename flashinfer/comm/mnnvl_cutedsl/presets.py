@@ -86,6 +86,8 @@ from .kernel_ll import (
     LL_ALL_REDUCE_RUBIN_TP4_H8192_BULK,
     LL_ALL_REDUCE_RUBIN_TP4_H8192_TWO_SHOT,
     LL_FINALIZE_RUBIN_TP4_H8192_K10,
+    LL_ALL_REDUCE_H200_TP8_H6144,
+    LL_FINALIZE_H200_TP8_H6144_K4,
 )
 from .kernel_ht import (
     HT_ALL_REDUCE_GB300_H3584,
@@ -896,6 +898,26 @@ HT_ONLY_CONFIG = MNNVLCuteDSLConfig(
 )
 
 
+# hidden_size=6144, bf16, top_k=4 (MiniMax-M3), TP8 on H200 (SM90). Hopper
+# runs the LL kernels only, so LL serves every M; it is 2.4-2.7x faster than
+# the TRT-LLM one-shot kernels at M <= 16.
+_H6144_TP8_H200_PROFILE = StaticProfile(
+    tp_size=8,
+    hidden_size=6144,
+    top_k=4,
+    dtype=torch.bfloat16,
+    finalize_routes=MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.LL, LL_FINALIZE_H200_TP8_H6144_K4),),
+    ),
+    all_reduce_routes=MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.LL, LL_ALL_REDUCE_H200_TP8_H6144),),
+    ),
+    compute_capability=(9, 0),
+)
+
+
 DEFAULT_CONFIG = MNNVLCuteDSLConfig(
     profiles=(
         StaticProfile(
@@ -998,6 +1020,7 @@ DEFAULT_CONFIG = MNNVLCuteDSLConfig(
         _H8192_TP4_GB300_PROFILE,
         *_h5120_profiles(_h5120_default_finalize, _h5120_default_all_reduce),
         *_h7168_profiles(_h7168_default_finalize, _h7168_default_all_reduce),
+        _H6144_TP8_H200_PROFILE,
     )
 )
 

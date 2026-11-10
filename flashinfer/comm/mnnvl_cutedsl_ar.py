@@ -167,10 +167,15 @@ def _check_arguments(
         raise ValueError("dynamic_fp8 requires output_dtype=float8_e4m3fn")
 
 
+def _check_finalize_operands(expert_weight_dtype: torch.dtype) -> None:
+    if expert_weight_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("expert_weight_dtype must be bfloat16 or float32")
+
+
 def _check_device(device: torch.device) -> None:
     """Device checks for the MNNVL kernels; raises ``RuntimeError``."""
-    if torch.cuda.get_device_capability(device)[0] < 10:
-        raise RuntimeError("MNNVL CuTe DSL kernels require a Blackwell GPU")
+    if torch.cuda.get_device_capability(device)[0] < 9:
+        raise RuntimeError("MNNVL CuTe DSL kernels require a Hopper or newer GPU")
     if symm_mem.get_backend(device) is None:
         raise RuntimeError("PyTorch Symmetric Memory is unavailable")
     if not is_multicast_supported(device.index):
@@ -188,11 +193,12 @@ def _resolve_profile(
     compute_capability: tuple[int, int],
     apply_rms_norm: bool,
     dynamic_fp8: bool,
+    ll_finalize_only: bool = False,
 ) -> StaticProfile:
     """Select the profile and check its routes against the compiled mode.
 
     Raises ``ValueError``, or ``NotImplementedError`` when a route needs the
-    norm the workspace compiles out.
+    norm the workspace compiles out or finalize operands only LL reads.
     """
     profile = config.resolve(
         tp_size=tp_size,
@@ -216,6 +222,21 @@ def _resolve_profile(
         for target in profile.all_reduce_routes.targets_for_capacity(max_token_num)
     ):
         raise ValueError("the LL two-shot all-reduce has no dynamic FP8 output")
+    # Hopper runs the LL kernels only: BT and HT use Blackwell features.
+    if compute_capability[0] < 10 and profile.referenced_protocols != frozenset(
+        {ProtocolKind.LL}
+    ):
+        raise ValueError("On Hopper the profile must route every M to LL")
+    if ll_finalize_only and (
+        profile.finalize_routes.max_m_for_protocol(
+            ProtocolKind.LL, capacity_m=max_token_num
+        )
+        != max_token_num
+    ):
+        raise NotImplementedError(
+            "FP32 expert weights and route-major rows are LL finalize options; "
+            "select a config that routes this capacity's finalize to LL"
+        )
     return profile
 
 
@@ -249,6 +270,8 @@ def _probe_support(
     write_norm_output: bool,
     config: MNNVLCuteDSLConfig | None,
     device: torch.device | int | str | None,
+    expert_weight_dtype: torch.dtype = torch.bfloat16,
+    route_major: bool = False,
 ) -> bool:
     """Implementation of :func:`flashinfer.comm.is_mnnvl_cutedsl_supported`."""
     try:
@@ -264,6 +287,7 @@ def _probe_support(
             dynamic_fp8=dynamic_fp8,
             config=resolved_config,
         )
+        _check_finalize_operands(expert_weight_dtype)
         if not torch.cuda.is_available():
             return False
         requested = (
@@ -288,6 +312,7 @@ def _probe_support(
             compute_capability=torch.cuda.get_device_capability(resolved_device),
             apply_rms_norm=apply_rms_norm,
             dynamic_fp8=dynamic_fp8,
+            ll_finalize_only=expert_weight_dtype != torch.bfloat16 or route_major,
         )
     except (ValueError, RuntimeError, NotImplementedError):
         return False
@@ -358,6 +383,16 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     Plain all-reduce: a workspace built with ``apply_rms_norm=False`` and
     ``add_residual=False`` also serves ``kAllReduce``, which writes the sum to
     ``output`` (allocated when omitted) and returns it.
+
+    MoE finalize operands: ``expert_weight_dtype=torch.float32`` takes FP32
+    ``expert_scale_factor`` (the router's weights, as Marlin MoE returns them)
+    instead of BF16. ``route_major=True`` takes ``input`` as ``[m * top_k,
+    hidden]`` rows where row ``t * top_k + k`` holds route ``(t, k)``, the
+    layout Marlin MoE writes; ``expanded_idx_to_permuted_idx`` is then
+    ``None``. Both are LL finalize options.
+
+    Hopper (SM90) with NVLink multicast runs the LL protocol only, so its
+    profiles route every token count to LL.
     """
 
     _destroyed: bool
@@ -383,6 +418,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         output_dtype: torch.dtype = torch.bfloat16,
         write_norm_output: bool = False,
         dynamic_fp8: bool = False,
+        expert_weight_dtype: torch.dtype = torch.bfloat16,
+        route_major: bool = False,
     ) -> None:
         # Every validation below raises before super().__init__() can set this,
         # and __del__ reads it. Mark the object destroyed up front so a rejected
@@ -401,6 +438,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             dynamic_fp8=dynamic_fp8,
             config=config,
         )
+        _check_finalize_operands(expert_weight_dtype)
         if not 0 <= tp_rank < tp_size:
             raise ValueError("tp_rank must be in [0, tp_size)")
         if not torch.cuda.is_available():
@@ -417,6 +455,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             compute_capability=torch.cuda.get_device_capability(device),
             apply_rms_norm=apply_rms_norm,
             dynamic_fp8=dynamic_fp8,
+            ll_finalize_only=expert_weight_dtype != torch.bfloat16 or route_major,
         )
         if group is None:
             if not dist.is_initialized():
@@ -444,6 +483,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.write_norm_output = write_norm_output
         self.dynamic_fp8 = dynamic_fp8
         self.apply_rms_norm = apply_rms_norm
+        self.expert_weight_dtype = expert_weight_dtype
+        self.route_major = route_major
         # The compiled kernels still take gamma and norm_output arguments when
         # the norm is guarded out, but never read or write them. A small owned
         # placeholder keeps the signature satisfied without allocating another
@@ -496,6 +537,8 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                     all_reduce_capacities=_preset_capacities(
                         self.profile.all_reduce_routes, protocol, capacity
                     ),
+                    expert_weight_dtype=expert_weight_dtype,
+                    route_major=route_major,
                 )
             elif protocol is ProtocolKind.BT:
                 instance = BTProtocol(
@@ -580,7 +623,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self,
         routed_output: torch.Tensor,
         expert_weights: torch.Tensor,
-        permuted_indices: torch.Tensor,
+        permuted_indices: torch.Tensor | None,
         shared_output: torch.Tensor | None,
         residual_source: torch.Tensor | None,
         gamma: torch.Tensor,
@@ -1011,7 +1054,11 @@ def _mnnvl_cutedsl_allreduce_fusion(
         return result if workspace.apply_rms_norm else residual_out
 
     if pattern in _FINALIZE_PATTERNS:
-        if expanded_idx_to_permuted_idx is None:
+        if workspace.route_major and expanded_idx_to_permuted_idx is not None:
+            raise ValueError(
+                "expanded_idx_to_permuted_idx must be None for a route_major workspace"
+            )
+        if not workspace.route_major and expanded_idx_to_permuted_idx is None:
             raise ValueError("expanded_idx_to_permuted_idx is required")
         if expert_scale_factor is None:
             raise ValueError("expert_scale_factor is required")
@@ -1023,14 +1070,14 @@ def _mnnvl_cutedsl_allreduce_fusion(
             raise ValueError(
                 "shared_expert_output must be None for this compiled workspace"
             )
-        m = expanded_idx_to_permuted_idx.shape[0]
+        m = expert_scale_factor.shape[0]
         if not 1 <= m <= workspace.max_token_num:
             raise ValueError("input token count exceeds workspace capacity")
         _warn_pdl_mismatch(workspace, pattern, m, launch_with_pdl)
         _check_tensor(
             input,
             "input",
-            shape=(None, hidden),
+            shape=(m * workspace.top_k if workspace.route_major else None, hidden),
             dtype=torch.bfloat16,
             device=device,
             alignment=16,
@@ -1039,18 +1086,19 @@ def _mnnvl_cutedsl_allreduce_fusion(
             expert_scale_factor,
             "expert_scale_factor",
             shape=(m, workspace.top_k),
-            dtype=torch.bfloat16,
+            dtype=workspace.expert_weight_dtype,
             device=device,
-            alignment=2,
+            alignment=expert_scale_factor.element_size(),
         )
-        _check_tensor(
-            expanded_idx_to_permuted_idx,
-            "expanded_idx_to_permuted_idx",
-            shape=(m, workspace.top_k),
-            dtype=torch.int32,
-            device=device,
-            alignment=4,
-        )
+        if expanded_idx_to_permuted_idx is not None:
+            _check_tensor(
+                expanded_idx_to_permuted_idx,
+                "expanded_idx_to_permuted_idx",
+                shape=(m, workspace.top_k),
+                dtype=torch.int32,
+                device=device,
+                alignment=4,
+            )
         if shared_expert_output is not None:
             _check_tensor(
                 shared_expert_output,

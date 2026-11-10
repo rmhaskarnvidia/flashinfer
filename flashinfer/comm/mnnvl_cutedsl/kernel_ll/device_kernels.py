@@ -113,6 +113,8 @@ class _ScalarFinalizePublishDeviceKernel:
         load_shared_expert_before_pdl: bool,
         enable_pdl: bool,
         prefetch_group: int,
+        fp32_weights: bool = False,
+        route_major: bool = False,
     ) -> None:
         if hidden <= 0 or hidden % 2:
             raise ValueError("hidden must be a positive multiple of 2")
@@ -129,6 +131,10 @@ class _ScalarFinalizePublishDeviceKernel:
         self.enable_pdl = enable_pdl
         self.prefetch_group = prefetch_group
         self.prefetch_groups = (top_k + prefetch_group - 1) // prefetch_group
+        # FP32 route weights instead of BF16.
+        self.fp32_weights = fp32_weights
+        # Row t * top_k + k holds route (t, k); permuted_indices is not read.
+        self.route_major = route_major
 
     def smem_size_in_bytes(self) -> int:
         return self.top_k * 8
@@ -182,13 +188,22 @@ class _ScalarFinalizePublishDeviceKernel:
         metadata_index = Int32(tidx)
         while metadata_index < Int32(self.top_k):
             element = Int64(token) * self.top_k + Int64(metadata_index)
-            row = cute.arch.load(
-                (permuted_indices.iterator + element).llvm_ptr,
-                Int32,
-            )
-            weight = load_global_bf16_as_f32(
-                Int64((expert_weights.iterator + element).toint())
-            )
+            if cutlass.const_expr(self.route_major):
+                row = token * Int32(self.top_k) + metadata_index
+            else:
+                row = cute.arch.load(
+                    (permuted_indices.iterator + element).llvm_ptr,
+                    Int32,
+                )
+            if cutlass.const_expr(self.fp32_weights):
+                weight = cute.arch.load(
+                    (expert_weights.iterator + element).llvm_ptr,
+                    Float32,
+                )
+            else:
+                weight = load_global_bf16_as_f32(
+                    Int64((expert_weights.iterator + element).toint())
+                )
             if cutlass.const_expr(self.routed_scaling_factor != 1.0):
                 weight = weight * Float32(self.routed_scaling_factor)
             if row == Int32(-1):
@@ -323,6 +338,8 @@ class _QuadFinalizePublishDeviceKernel:
         load_shared_expert_before_pdl: bool,
         enable_pdl: bool,
         prefetch_group: int,
+        fp32_weights: bool = False,
+        route_major: bool = False,
     ) -> None:
         if hidden <= 0 or hidden % QUAD_BF16:
             raise ValueError("hidden must be a positive multiple of 4")
@@ -340,6 +357,10 @@ class _QuadFinalizePublishDeviceKernel:
         self.enable_pdl = enable_pdl
         self.prefetch_group = prefetch_group
         self.prefetch_groups = (top_k + prefetch_group - 1) // prefetch_group
+        # FP32 route weights instead of BF16.
+        self.fp32_weights = fp32_weights
+        # Row t * top_k + k holds route (t, k); permuted_indices is not read.
+        self.route_major = route_major
 
     def smem_size_in_bytes(self) -> int:
         return self.top_k * 8
@@ -393,13 +414,22 @@ class _QuadFinalizePublishDeviceKernel:
         metadata_index = Int32(tidx)
         while metadata_index < Int32(self.top_k):
             element = Int64(token) * self.top_k + Int64(metadata_index)
-            row = cute.arch.load(
-                (permuted_indices.iterator + element).llvm_ptr,
-                Int32,
-            )
-            weight = load_global_bf16_as_f32(
-                Int64((expert_weights.iterator + element).toint())
-            )
+            if cutlass.const_expr(self.route_major):
+                row = token * Int32(self.top_k) + metadata_index
+            else:
+                row = cute.arch.load(
+                    (permuted_indices.iterator + element).llvm_ptr,
+                    Int32,
+                )
+            if cutlass.const_expr(self.fp32_weights):
+                weight = cute.arch.load(
+                    (expert_weights.iterator + element).llvm_ptr,
+                    Float32,
+                )
+            else:
+                weight = load_global_bf16_as_f32(
+                    Int64((expert_weights.iterator + element).toint())
+                )
             if cutlass.const_expr(self.routed_scaling_factor != 1.0):
                 weight = weight * Float32(self.routed_scaling_factor)
             if row == Int32(-1):

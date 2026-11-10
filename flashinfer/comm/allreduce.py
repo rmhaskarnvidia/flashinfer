@@ -382,6 +382,8 @@ def create_allreduce_fusion_workspace(
     dynamic_fp8: Optional[bool] = None,
     write_norm_output: Optional[bool] = None,
     config: Optional["MNNVLCuteDSLConfig"] = None,
+    expert_weight_dtype: Optional[torch.dtype] = None,
+    route_major: Optional[bool] = None,
 ) -> AllReduceFusionWorkspace:
     r"""Create workspace for AllReduce fusion operations.
 
@@ -468,6 +470,13 @@ def create_allreduce_fusion_workspace(
     write_norm_output : Optional[bool]
         Also write the BF16 norm for the ``*Out*`` FP8 patterns (4 and 11).
         Default ``False``.
+    expert_weight_dtype : Optional[torch.dtype]
+        dtype of ``expert_scale_factor`` for the MoE finalize patterns:
+        ``torch.bfloat16`` (default) or ``torch.float32``.
+    route_major : Optional[bool]
+        MoE finalize reads route ``(t, k)`` from row ``t * top_k + k`` of its
+        input, as Marlin MoE writes it, and takes no
+        ``expanded_idx_to_permuted_idx``. Default ``False``.
     config : Optional[MNNVLCuteDSLConfig]
         Static profiles and token-count routes. Defaults to
         ``DEFAULT_CONFIG`` with the norm and ``NO_NORM_CONFIG`` without it.
@@ -547,6 +556,8 @@ def create_allreduce_fusion_workspace(
             ("dynamic_fp8", dynamic_fp8),
             ("write_norm_output", write_norm_output),
             ("config", config),
+            ("expert_weight_dtype", expert_weight_dtype),
+            ("route_major", route_major),
         )
         if value is not None
     }
@@ -682,6 +693,8 @@ def is_mnnvl_cutedsl_supported(
     write_norm_output: bool = False,
     config: Optional["MNNVLCuteDSLConfig"] = None,
     device: Optional[Union[torch.device, int, str]] = None,
+    expert_weight_dtype: torch.dtype = torch.bfloat16,
+    route_major: bool = False,
 ) -> bool:
     r"""Whether this rank passes the ``backend="mnnvl-cutedsl"`` workspace checks.
 
@@ -692,8 +705,9 @@ def is_mnnvl_cutedsl_supported(
     combination, ``config`` has a static profile for
     ``(tp_size, hidden_dim, top_k, dtype)`` on the device's compute capability
     whose routes cover ``max_token_num`` and suit ``apply_rms_norm`` and
-    ``dynamic_fp8``, and the device is a Blackwell-class GPU with PyTorch
-    symmetric memory and NVLink multicast. The workspace constructor runs the
+    ``dynamic_fp8``, and the device is a Hopper or newer GPU with PyTorch
+    symmetric memory and NVLink multicast (on Hopper, the profile must route
+    every token count to the LL protocol). The workspace constructor runs the
     same checks with the same arguments.
 
     ``True`` does not guarantee that construction succeeds: building the
@@ -733,6 +747,10 @@ def is_mnnvl_cutedsl_supported(
         and ``NO_NORM_CONFIG`` without it, as the workspace does.
     device : Optional[Union[torch.device, int, str]]
         CUDA device to check. Defaults to the current device.
+    expert_weight_dtype : torch.dtype
+        As the workspace argument. Default ``torch.bfloat16``.
+    route_major : bool
+        As the workspace argument. Default ``False``.
 
     Returns
     -------
@@ -756,6 +774,8 @@ def is_mnnvl_cutedsl_supported(
         write_norm_output=write_norm_output,
         config=config,
         device=device,
+        expert_weight_dtype=expert_weight_dtype,
+        route_major=route_major,
     )
 
 
@@ -1001,10 +1021,12 @@ def allreduce_fusion(
     expanded_idx_to_permuted_idx : Optional[torch.Tensor]
         Mapping from ``(token, topk_idx)`` to permuted expert output row.
         Shape ``[token_num, top_k]``, dtype ``int32``. Required for the MoE
-        finalize patterns (7 and 12).
+        finalize patterns (7 and 12), except on an MNNVL CuTe DSL workspace
+        built with ``route_major=True``, where it must be ``None``.
     expert_scale_factor : Optional[torch.Tensor]
         Router weights for each selected expert, shape
-        ``[token_num, top_k]``.
+        ``[token_num, top_k]``; FP32 on an MNNVL CuTe DSL workspace built with
+        ``expert_weight_dtype=torch.float32``.
     shared_expert_output : Optional[torch.Tensor]
         Optional shared-expert output to add, shape
         ``[token_num, hidden_dim]``.

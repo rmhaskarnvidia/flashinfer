@@ -23,7 +23,7 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Float8E4M3FN, Int32, Int64
+from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64
 from cutlass.cute.runtime import make_fake_compact_tensor
 
 from ..cute_dsl_primitives import QUAD_BF16
@@ -185,6 +185,17 @@ LL_FINALIZE_GB300_TP8_H7168_K16 = LLFinalizeTuning(
 )
 LL_ALL_REDUCE_GB300_TP4_H7168 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H7168)
 LL_ALL_REDUCE_GB300_TP8_H7168 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H7168)
+
+# hidden_size=6144, bf16, top_k=4 (MiniMax-M3), TP8 on H200. A token is 768
+# bf16x8 fragments; twelve 64-thread CTAs cover it in one trip. Measured
+# against six 128-thread CTAs (within 0.1 us), two rank lanes (0.3-0.6 us
+# slower) and the scalar finalize (slower above M=4).
+_LL_COLLECTIVE_H200_H6144 = LLCollectiveTuning(cluster_size=12, threads=64)
+
+LL_FINALIZE_H200_TP8_H6144_K4 = LLFinalizeTuning(
+    prefetch_group=4, collective=_LL_COLLECTIVE_H200_H6144
+)
+LL_ALL_REDUCE_H200_TP8_H6144 = LLAllReduceTuning(collective=_LL_COLLECTIVE_H200_H6144)
 
 
 @dataclass(slots=True)
@@ -373,15 +384,18 @@ class _LLPath:
 
 
 class FinalizeAllReduceRMSNormLLKernel(_LLPath):
-    def __init__(self, *, compiled: _CompiledFinalize, **kwargs) -> None:
+    def __init__(
+        self, *, compiled: _CompiledFinalize, route_major: bool = False, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self._compiled = compiled
+        self._route_major = route_major
 
     def __call__(
         self,
         routed_output: torch.Tensor,
         expert_weights: torch.Tensor,
-        permuted_indices: torch.Tensor,
+        permuted_indices: torch.Tensor | None,
         shared_output: torch.Tensor | None,
         residual_source: torch.Tensor | None,
         gamma: torch.Tensor,
@@ -396,10 +410,20 @@ class FinalizeAllReduceRMSNormLLKernel(_LLPath):
         self._validate_state(state, m)
         norm_output, residual_output = self._outputs(m, norm_output, residual_output)
         shared_arg = shared_output if shared_output is not None else gamma
+        # Route-major rows need no index; the publish never reads this slot.
+        index_arg = state.stage_state if self._route_major else permuted_indices
         self._compiled.publish(
             to_cute_dynamic(routed_output.flatten(), 16, divisibility=self.hidden_size),
-            to_cute_dynamic(expert_weights.flatten(), 2, divisibility=self.top_k),
-            to_cute_dynamic(permuted_indices.flatten(), 4, divisibility=self.top_k),
+            to_cute_dynamic(
+                expert_weights.flatten(),
+                expert_weights.element_size(),
+                divisibility=self.top_k,
+            ),
+            to_cute_dynamic(
+                cast(torch.Tensor, index_arg).flatten(),
+                4,
+                divisibility=2 if self._route_major else self.top_k,
+            ),
             to_cute_dynamic(shared_arg.flatten(), 16, divisibility=self.hidden_size),
             to_cute(state.stage_state, 4),
             Int64(cast(int, state.contribution_mailbox.multicast_address)),
@@ -555,10 +579,13 @@ class LLProtocol:
         write_norm_output: bool = False,
         dynamic_fp8: bool = False,
         all_reduce_capacities: Mapping[LLAllReduceTuning, int] | None = None,
+        expert_weight_dtype: torch.dtype = torch.bfloat16,
+        route_major: bool = False,
     ) -> None:
         """``all_reduce_capacities`` maps an all-reduce tuning to the largest
         ``m`` it serves (at most ``capacity_m``, the default); a two-shot
-        tuning sizes its own mailboxes to it."""
+        tuning sizes its own mailboxes to it. ``expert_weight_dtype`` and
+        ``route_major`` set the finalize operands (see the workspace)."""
         self.hidden_size = hidden_size
         self.top_k = top_k
         self.tp_size = tp_size
@@ -574,6 +601,8 @@ class LLProtocol:
         self.write_norm_output = write_norm_output
         self.dynamic_fp8 = dynamic_fp8
         self.apply_rms_norm = apply_rms_norm
+        self.expert_weight_dtype = expert_weight_dtype
+        self.route_major = route_major
 
         for tuning in all_reduce_tunings:
             if tuning.peer_stores and tuning.publish_elements_per_thread != 8:
@@ -606,6 +635,7 @@ class LLProtocol:
                     publish=self._compile_finalize(tuning),
                     collective=collective_cache[tuning.collective],
                 ),
+                route_major=route_major,
                 **self._path_kwargs(),
             )
             for tuning in dict.fromkeys(finalize_tunings)
@@ -692,6 +722,8 @@ class LLProtocol:
             "load_shared_expert_before_pdl": tuning.load_shared_expert_before_pdl,
             "enable_pdl": tuning.collective.enable_pdl,
             "prefetch_group": tuning.prefetch_group,
+            "fp32_weights": self.expert_weight_dtype == torch.float32,
+            "route_major": self.route_major,
         }
         device_kernel = (
             _ScalarFinalizePublishDeviceKernel(**kwargs)
@@ -703,10 +735,12 @@ class LLProtocol:
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
             make_fake_dynamic_compact_tensor(
-                BFloat16, alignment=2, divisibility=self.top_k
+                Float32 if self.expert_weight_dtype == torch.float32 else BFloat16,
+                alignment=4 if self.expert_weight_dtype == torch.float32 else 2,
+                divisibility=self.top_k,
             ),
             make_fake_dynamic_compact_tensor(
-                Int32, alignment=4, divisibility=self.top_k
+                Int32, alignment=4, divisibility=2 if self.route_major else self.top_k
             ),
             make_fake_dynamic_compact_tensor(
                 BFloat16, alignment=16, divisibility=self.hidden_size
