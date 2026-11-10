@@ -131,6 +131,7 @@ from .jit.cake_bgmv_moe import (
 from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
 from .jit.gemm import (
+    gen_bf16_mxfp8_hopper_low_latency_module,
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
     gen_gemm_sm90_module,
@@ -972,6 +973,7 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
+            jit_specs.append(gen_bf16_mxfp8_hopper_low_latency_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
